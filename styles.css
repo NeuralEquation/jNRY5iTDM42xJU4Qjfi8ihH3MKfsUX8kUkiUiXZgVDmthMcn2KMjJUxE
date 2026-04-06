@@ -144,10 +144,14 @@ a {
 .ghost-button,
 .wait-button {
   min-height: 46px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 14px;
   border: 0;
   cursor: pointer;
   transition: transform 0.18s ease, background-color 0.18s ease, opacity 0.18s ease;
+  text-decoration: none;
 }
 
 .tab-button {
@@ -245,6 +249,18 @@ a {
   color: var(--text);
   font-weight: 700;
   padding: 0 14px;
+}
+
+#wait-import-heading + .helper-copy,
+#wait-import-status {
+  margin-top: 0;
+}
+
+#wait-import-bookmarklet-link,
+#wait-import-copy-button,
+#wait-import-paste-button,
+#wait-import-reset-button {
+  margin-top: 4px;
 }
 
 .wait-button {
