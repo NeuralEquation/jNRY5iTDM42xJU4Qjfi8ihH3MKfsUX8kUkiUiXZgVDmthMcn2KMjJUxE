@@ -45,6 +45,27 @@
           <button class="secondary-button danger-button" id="use-center-button" type="button">位置がわからない</button>
         </div>
       </div>
+      <div class="location-status" aria-labelledby="wait-import-heading">
+        <div class="location-card">
+          <div class="section-head compact">
+            <div>
+              <p class="section-kicker">待ち時間</p>
+              <h2 id="wait-import-heading">待ち時間の確認</h2>
+            </div>
+            <button class="secondary-button" id="wait-import-open-button" type="button">待ち時間を確認する</button>
+          </div>
+          <p class="helper-copy">1. 待ち時間を確認する 　2. 開いたページでブックマークレットを押す</p>
+          <div class="inline-actions">
+            <a class="primary-button" id="wait-import-bookmarklet-link" href="#">ブックマークレット</a>
+            <button class="ghost-button" id="wait-import-copy-button" type="button">文字列をコピー</button>
+            <button class="ghost-button" id="wait-import-paste-button" type="button">クリップボードから反映</button>
+            <button class="secondary-button danger-button" id="wait-import-reset-button" type="button">待ち時間をリセット</button>
+          </div>
+          <div class="badge-row">
+            <span class="status-pill neutral" id="wait-import-status">未取得</span>
+          </div>
+        </div>
+      </div>
     </section>
 
     <div class="guide-banner" aria-label="使い方ガイド">
@@ -139,8 +160,10 @@
   </div>
 
   <script src="./data/attractions.js"></script>
+  <script src="./attraction-durations.js"></script>
   <script src="./data/restaurants.js"></script>
   <script src="./data/restaurant-menus.js"></script>
+  <script src="./wait-import-config.js"></script>
   <script src="./app.js"></script>
 </body>
 </html>
