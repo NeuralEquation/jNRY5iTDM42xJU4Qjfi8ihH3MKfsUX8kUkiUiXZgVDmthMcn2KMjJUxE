@@ -14,6 +14,25 @@
   const WAIT_WEIGHT = 1.0;
   const TRAVEL_WEIGHT = 1.25;
   const UNKNOWN_WAIT_PENALTY = 45;
+  const WAIT_IMPORT_PREFIX = "TDR_WAIT_IMPORT:";
+  const WAIT_IMPORT_SOURCE = "ディズニーリアル";
+  const WAIT_IMPORT_PENDING_KEY = "tdlWaitImportPending";
+  const WAIT_IMPORT_CONFIG = window.TDR_WAIT_IMPORT_CONFIG || { parkId: "", disneyRealUrl: "", entries: [] };
+  const ATTRACTION_DURATIONS = window.TDL_ATTRACTION_DURATIONS || {};
+  const KNOWN_WAIT_STATUS_REASONS = [
+    "プライオリティ・アクセス・エントランスをご利用の方のみ案内中",
+    "終日運営・公演中止",
+    "一時運営中止",
+    "運営中 待ち時間は施設でご確認ください。",
+    "案内終了"
+  ];
+  const WAIT_STATUS_STAMP_LABELS = {
+    "プライオリティ・アクセス・エントランスをご利用の方のみ案内中": "PAのみ",
+    "終日運営・公演中止": "終日中止",
+    "一時運営中止": "一時中止",
+    "運営中 待ち時間は施設でご確認ください。": "現地確認",
+    "案内終了": "案内終了"
+  };
 
   const AREA_CODE_MAP = {
     "ワールドバザール": "WB",
@@ -83,7 +102,11 @@
   ];
 
   const state = {
-    attractions: Array.isArray(window.TDS_ATTRACTIONS) ? window.TDS_ATTRACTIONS.slice() : [],
+    attractions: Array.isArray(window.TDS_ATTRACTIONS) ? window.TDS_ATTRACTIONS.map(function (item) {
+      return Object.assign({}, item, {
+        durationMinutes: Number.isInteger(ATTRACTION_DURATIONS[item.id]) ? ATTRACTION_DURATIONS[item.id] : null
+      });
+    }) : [],
     restaurants: Array.isArray(window.TDS_RESTAURANTS) ? window.TDS_RESTAURANTS.slice() : [],
     restaurantMenus: Array.isArray(window.TDS_RESTAURANT_MENUS) ? window.TDS_RESTAURANT_MENUS.slice() : [],
     restaurantMenuIndex: {},
@@ -106,6 +129,7 @@
   const attractionMap = new Map(state.attractions.map(function (item) {
     return [item.id, item];
   }));
+  const waitImportLookup = buildWaitImportLookup();
 
   const refs = {};
 
@@ -158,9 +182,12 @@
     }
 
     bindEvents();
+    initWaitImport();
     registerServiceWorker();
     refs.routeStartTime.value = isValidTimeString(state.routeStartTime) ? state.routeStartTime : "";
     renderAll();
+    tryImportWaitTimesFromWindowName();
+    tryImportWaitTimesFromHash();
     requestGpsLocation();
   }
 
@@ -183,6 +210,12 @@
     refs.toggleTimesButton = document.getElementById("toggle-times-button");
     refs.attractionsCount = document.getElementById("attractions-count");
     refs.restaurantsCount = document.getElementById("restaurants-count");
+    refs.waitImportOpenButton = document.getElementById("wait-import-open-button");
+    refs.waitImportBookmarkletLink = document.getElementById("wait-import-bookmarklet-link");
+    refs.waitImportCopyButton = document.getElementById("wait-import-copy-button");
+    refs.waitImportPasteButton = document.getElementById("wait-import-paste-button");
+    refs.waitImportResetButton = document.getElementById("wait-import-reset-button");
+    refs.waitImportStatus = document.getElementById("wait-import-status");
   }
 
   function bindEvents() {
@@ -226,6 +259,8 @@
 
     window.addEventListener("online", handleNetworkChange);
     window.addEventListener("offline", handleNetworkChange);
+    window.addEventListener("hashchange", tryImportWaitTimesFromHash);
+    window.addEventListener("message", handleWaitImportMessage);
   }
 
   function renderAll() {
@@ -233,6 +268,231 @@
     renderAttractions();
     renderRanking();
     renderRestaurants();
+  }
+
+  function initWaitImport() {
+    if (!refs.waitImportOpenButton || !refs.waitImportBookmarkletLink || !refs.waitImportStatus) {
+      return;
+    }
+
+    refs.waitImportBookmarkletLink.setAttribute("href", buildWaitImportBookmarklet());
+    refs.waitImportBookmarkletLink.addEventListener("click", function (event) {
+      event.preventDefault();
+    });
+
+    refs.waitImportOpenButton.addEventListener("click", function () {
+      if (WAIT_IMPORT_CONFIG.disneyRealUrl) {
+        try {
+          window.sessionStorage.setItem(WAIT_IMPORT_PENDING_KEY, "1");
+        } catch (error) {}
+        window.open(WAIT_IMPORT_CONFIG.disneyRealUrl, "_blank");
+        updateWaitImportStatus("neutral", "ディズニーリアルを新しいタブで開きました");
+      }
+    });
+
+    refs.waitImportCopyButton.addEventListener("click", function () {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) {
+        updateWaitImportStatus("danger", "コピー未対応");
+        return;
+      }
+      navigator.clipboard.writeText(refs.waitImportBookmarkletLink.getAttribute("href")).then(function () {
+        updateWaitImportStatus("ok", "文字列をコピーしました");
+      }).catch(function () {
+        updateWaitImportStatus("danger", "コピー失敗");
+      });
+    });
+
+    refs.waitImportPasteButton.addEventListener("click", function () {
+      if (!navigator.clipboard || !navigator.clipboard.readText) {
+        updateWaitImportStatus("danger", "貼り付け未対応");
+        return;
+      }
+      navigator.clipboard.readText().then(function (text) {
+        applyImportedWaitPayload(JSON.parse(text));
+      }).catch(function () {
+        updateWaitImportStatus("danger", "反映失敗");
+      });
+    });
+
+    if (refs.waitImportResetButton) {
+      refs.waitImportResetButton.addEventListener("click", function () {
+        state.waitTimes = {};
+        persistState();
+        renderAll();
+        updateWaitImportStatus("danger", "待ち時間をリセットしました");
+      });
+    }
+
+    updateWaitImportStatus("neutral", "未取得");
+  }
+
+  function updateWaitImportStatus(tone, text) {
+    if (!refs.waitImportStatus) {
+      return;
+    }
+    refs.waitImportStatus.className = "status-pill " + (tone || "neutral");
+    refs.waitImportStatus.textContent = text;
+  }
+
+  function handleWaitImportMessage(event) {
+    if (!event.data || event.data.type !== WAIT_IMPORT_PREFIX) {
+      return;
+    }
+    applyImportedWaitPayload(event.data.payload);
+  }
+
+  function normalizeWaitImportName(value) {
+    return String(value || "")
+      .normalize("NFKC")
+      .replace(/[：:]/g, "")
+      .replace(/[“”"'＂’‘]/g, "")
+      .replace(/[！!]/g, "")
+      .replace(/[?？.,，、()（）]/g, "")
+      .replace(/[・]/g, "")
+      .replace(/[＆&]/g, "and")
+      .replace(/\s+/g, "")
+      .toLowerCase();
+  }
+
+  function normalizeWaitImportPath(value) {
+    return String(value || "")
+      .replace(/^.*\/attraction\//, "")
+      .replace(/\.html.*$/, "")
+      .trim()
+      .toLowerCase();
+  }
+
+  function detectKnownWaitStatusReason(text) {
+    const normalized = String(text || "").replace(/\s+/g, "");
+    return KNOWN_WAIT_STATUS_REASONS.find(function (reason) {
+      return normalized.indexOf(reason.replace(/\s+/g, "")) >= 0;
+    }) || "";
+  }
+
+  function buildWaitImportLookup() {
+    const byPath = new Map();
+    const byName = new Map();
+
+    state.attractions.forEach(function (item) {
+      const normalized = normalizeWaitImportName(item.name);
+      if (normalized && !byName.has(normalized)) {
+        byName.set(normalized, item.id);
+      }
+    });
+
+    (WAIT_IMPORT_CONFIG.entries || []).forEach(function (entry) {
+      const matched = state.attractions.find(function (item) {
+        if (entry.area && item.area !== entry.area) {
+          return false;
+        }
+        return (entry.names || []).some(function (name) {
+          return normalizeWaitImportName(name) === normalizeWaitImportName(item.name);
+        });
+      });
+
+      if (matched && entry.path) {
+        byPath.set(normalizeWaitImportPath(entry.path), matched.id);
+      }
+
+      (entry.names || []).forEach(function (name) {
+        const normalized = normalizeWaitImportName(name);
+        if (normalized && matched) {
+          byName.set(normalized, matched.id);
+        }
+      });
+    });
+
+    return { byPath: byPath, byName: byName };
+  }
+
+  function buildWaitImportBookmarklet() {
+    const returnUrl = window.location.origin + window.location.pathname + window.location.search;
+    const source = "(function(){var RETURN_URL=" + JSON.stringify(returnUrl) + ";var PREFIX=" + JSON.stringify(WAIT_IMPORT_PREFIX) + ";var PARK=" + JSON.stringify(WAIT_IMPORT_CONFIG.parkId || "") + ";var KNOWN=" + JSON.stringify(KNOWN_WAIT_STATUS_REASONS) + ";function n(v){return String(v||'').replace(/\\s+/g,' ').trim();}function p(v){return String(v||'').replace(/^.*\\/attraction\\//,'').replace(/\\.html.*$/,'').trim().toLowerCase();}function w(t){var m=n(t).match(/(\\d+)/);return m?Number(m[1]):null;}function k(t){var x=n(t).replace(/\\s+/g,'');for(var i=0;i<KNOWN.length;i++){if(x.indexOf(KNOWN[i].replace(/\\s+/g,''))>=0){return KNOWN[i];}}return '';}function d(items){var seen={};return items.filter(function(item){var key=(item.path||item.name)+'__'+item.kind+'__'+(item.waitMinutes||item.statusReason||'');if(seen[key]){return false;}seen[key]=true;return true;});}var rows=Array.prototype.slice.call(document.querySelectorAll(\"div.rtcontena table.realtime a[href*='/attraction/']\"));var items=d(rows.map(function(link,index){var name=n((link.querySelector('h4')||{}).textContent);var path=p(link.getAttribute('href')||'');var waitNode=link.querySelector('.actual .time p');var wait=waitNode?w(waitNode.textContent):null;if(typeof wait==='number'&&isFinite(wait)){return {index:index,path:path,name:name,kind:'wait',waitMinutes:wait,rawText:n(link.textContent)};}var statusTexts=Array.prototype.slice.call(link.querySelectorAll('.desc p,.desc .runstat')).map(function(node){return n(node.textContent);}).filter(Boolean);var joined=statusTexts.join(' / ')||n(link.textContent);var known=k(joined);if(known){return {index:index,path:path,name:name,kind:'status',statusReason:known,rawText:joined};}return {index:index,path:path,name:name,kind:'manual-needed',statusReason:'待ち時間を取得できませんでした。',rawText:joined};}).filter(Boolean));var payload={schemaVersion:1,source:'disneyreal-jp',park:PARK,fetchedAt:new Date().toISOString(),items:items};if(!payload.items.length){alert('待ち時間を抽出できませんでした。');return;}var json=JSON.stringify(payload);function done(){if(window.opener&&!window.opener.closed){try{window.opener.postMessage({type:PREFIX,payload:payload},'*');}catch(e){}try{window.opener.location=RETURN_URL+'#tdr_import='+encodeURIComponent(json);}catch(e){window.name=PREFIX+json;location.href=RETURN_URL+'#tdr_import='+encodeURIComponent(json);return;}window.setTimeout(function(){try{window.close();}catch(e){}},150);return;}window.name=PREFIX+json;location.href=RETURN_URL+'#tdr_import='+encodeURIComponent(json);}if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(json).then(done,done);}else{done();}})();";
+    return "javascript:" + source;
+  }
+
+  function tryImportWaitTimesFromWindowName() {
+    if (!window.name || window.name.indexOf(WAIT_IMPORT_PREFIX) !== 0) {
+      return;
+    }
+    try {
+      applyImportedWaitPayload(JSON.parse(window.name.slice(WAIT_IMPORT_PREFIX.length)));
+    } catch (error) {
+      updateWaitImportStatus("danger", "自動反映失敗");
+    }
+    try {
+      window.sessionStorage.removeItem(WAIT_IMPORT_PENDING_KEY);
+    } catch (error) {}
+    window.name = "";
+  }
+
+  function tryImportWaitTimesFromHash() {
+    if (!window.location.hash || window.location.hash.indexOf("#tdr_import=") !== 0) {
+      return;
+    }
+    try {
+      applyImportedWaitPayload(JSON.parse(decodeURIComponent(window.location.hash.slice("#tdr_import=".length))));
+    } catch (error) {
+      updateWaitImportStatus("danger", "自動反映失敗");
+    }
+    try {
+      window.sessionStorage.removeItem(WAIT_IMPORT_PENDING_KEY);
+    } catch (error) {}
+    if (window.history && window.history.replaceState) {
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+  }
+
+  function applyImportedWaitPayload(payload) {
+    if (!payload || payload.park !== WAIT_IMPORT_CONFIG.parkId || !Array.isArray(payload.items)) {
+      updateWaitImportStatus("danger", "反映失敗");
+      return;
+    }
+
+    let appliedCount = 0;
+    payload.items.forEach(function (item) {
+      const attractionId = waitImportLookup.byPath.get(normalizeWaitImportPath(item.path))
+        || waitImportLookup.byName.get(normalizeWaitImportName(item.name));
+      if (!attractionId) {
+        return;
+      }
+
+      if (item.kind === "wait" && Number.isFinite(item.waitMinutes)) {
+        state.waitTimes[attractionId] = {
+          waitTime: Math.max(0, Math.round(item.waitMinutes)),
+          source: WAIT_IMPORT_SOURCE,
+          importedAt: payload.fetchedAt || "",
+          importState: "wait"
+        };
+        appliedCount += 1;
+        return;
+      }
+
+      const knownReason = detectKnownWaitStatusReason([item.statusReason, item.rawText].filter(Boolean).join(" / "));
+      if (knownReason) {
+        state.waitTimes[attractionId] = {
+          source: WAIT_IMPORT_SOURCE,
+          importedAt: payload.fetchedAt || "",
+          importState: "status",
+          statusReason: knownReason
+        };
+        appliedCount += 1;
+        return;
+      }
+
+      state.waitTimes[attractionId] = {
+        source: WAIT_IMPORT_SOURCE,
+        importedAt: payload.fetchedAt || "",
+        importState: "manual-needed",
+        statusReason: "待ち時間を取得できませんでした。"
+      };
+      appliedCount += 1;
+    });
+
+    persistState();
+    renderAll();
+    switchTab("attractions");
+    updateWaitImportStatus(appliedCount ? "ok" : "danger", appliedCount ? ("反映 " + appliedCount + "件") : "一致なし");
   }
 
   function renderAttractions() {
@@ -262,18 +522,26 @@
 
   function renderAttractionCard(item) {
     const waitTime = getWaitTime(item.id);
+    const waitEntry = getWaitEntry(item.id);
+    const importState = getWaitImportState(item.id);
+    const importReason = getWaitImportReason(item.id);
     const alreadyAdded = state.selectedAttractions.includes(item.id);
     const unavailable = isAttractionUnavailable(item);
     const waitValue = waitTime === null ? "" : String(waitTime);
     const waitBadge = waitTime === null
-      ? "<span class=\"badge neutral\">待ち時間: 未入力</span>"
+      ? (importState === "status"
+        ? "<span class=\"badge unavailable\">待ち時間: 状態表示</span>"
+        : importState === "manual-needed"
+          ? "<span class=\"badge neutral\">待ち時間: 要入力</span>"
+          : "<span class=\"badge neutral\">待ち時間: 未入力</span>")
       : "<span class=\"badge\">待ち時間: " + waitTime + "分</span>";
+    const stampLabel = UNAVAILABLE_ATTRACTION_IDS.has(item.id) ? "休止中" : getWaitStatusStampLabel(importReason);
 
     return "" +
       "<article class=\"card attraction-card" + (unavailable ? " is-unavailable" : "") + "\">" +
         "<div class=\"attraction-visual\">" +
           (item.imageUrl ? "<img src=\"" + escapeHtml(item.imageUrl) + "\" alt=\"" + escapeHtml(item.name) + "\" loading=\"lazy\" decoding=\"async\">" : "") +
-          (unavailable ? "<span class=\"unavailable-stamp\">休止中</span>" : "") +
+          (unavailable ? "<span class=\"unavailable-stamp\">" + escapeHtml(stampLabel) + "</span>" : "") +
         "</div>" +
         "<div class=\"card-body\">" +
           "<div class=\"card-topline\">" +
@@ -284,9 +552,13 @@
           "<div class=\"badge-row\">" +
             "<span class=\"badge\">" + escapeHtml(item.category) + "</span>" +
             (item.displayCategory ? "<span class=\"badge alt\">" + escapeHtml(item.displayCategory) + "</span>" : "") +
-            (unavailable ? "<span class=\"badge unavailable\">休止中</span>" : "") +
+            (Number.isInteger(item.durationMinutes) ? "<span class=\"badge alt\">所要: " + item.durationMinutes + "分</span>" : "") +
+            (unavailable ? "<span class=\"badge unavailable\">" + escapeHtml(importReason || "休止中") + "</span>" : "") +
+            (waitEntry && waitEntry.source === WAIT_IMPORT_SOURCE && importState === "wait" ? "<span class=\"badge alt\">自動取得</span>" : "") +
+            (importState === "manual-needed" ? "<span class=\"badge neutral\">待ち時間を取得できませんでした。</span>" : "") +
           "</div>" +
           "<p class=\"card-description\">" + escapeHtml(item.description || "") + "</p>" +
+          (importState === "manual-needed" ? "<p class=\"helper-copy\">自動取得できなかったため、この項目だけ手動で入力してください。</p>" : "") +
           "<div class=\"wait-controls\" aria-label=\"" + escapeHtml(item.name) + " の待ち時間入力\">" +
             "<button class=\"wait-button\" type=\"button\" data-wait-action=\"decrease\" data-id=\"" + escapeHtml(item.id) + "\" " + (unavailable ? "disabled" : "") + ">-15</button>" +
             "<input class=\"wait-input\" inputmode=\"numeric\" pattern=\"[0-9]*\" placeholder=\"分\" aria-label=\"" + escapeHtml(item.name) + " の待ち時間\" data-wait-input=\"" + escapeHtml(item.id) + "\" value=\"" + escapeHtml(waitValue) + "\" " + (unavailable ? "disabled" : "") + ">" +
@@ -295,7 +567,7 @@
         "<div class=\"card-footer\">" +
           "<div class=\"inline-actions\">" +
                 "<button class=\"" + (alreadyAdded || unavailable ? "secondary-button" : "primary-button") + "\" type=\"button\" data-add-ranking=\"" + escapeHtml(item.id) + "\" " + (alreadyAdded || unavailable ? "disabled" : "") + ">" +
-                (unavailable ? "休止中" : alreadyAdded ? "追加済み" : "候補に追加") +
+                (unavailable ? "案内不可" : alreadyAdded ? "追加済み" : "候補に追加") +
               "</button>" +
             "</div>" +
             renderDetailLink(item.detailUrl) +
@@ -307,7 +579,9 @@
   function renderRanking() {
     const selectedItems = state.selectedAttractions.map(function (id) {
       return attractionMap.get(id);
-    }).filter(Boolean);
+    }).filter(Boolean).filter(function (item) {
+      return !isAttractionUnavailable(item);
+    });
 
     refs.rankingSummary.innerHTML = buildRankingSummary(selectedItems);
     refs.toggleTimesButton.classList.toggle("is-on", Boolean(state.showRouteTimes));
@@ -358,6 +632,7 @@
     refs.rankingList.innerHTML = scored.map(function (entry, index) {
       const waitLabel = entry.waitTime === null ? "未入力" : entry.waitTime + "分";
       const travelLabel = entry.travelInfo.minutes + "分";
+      const durationLabel = Number.isInteger(entry.item.durationMinutes) ? entry.item.durationMinutes + "分" : "未設定";
       const travelHint = entry.travelInfo.mode === "gps"
         ? "GPS概算 / " + escapeHtml(AREA_DISPLAY_NAMES[entry.travelInfo.areaCode] || "")
         : entry.travelInfo.mode === "fallback-center"
@@ -370,7 +645,7 @@
         ? "" +
           "<div class=\"timeline-block\">" +
             "<p class=\"timeline-line\">" + escapeHtml(routeStep.arrivalTime) + " 到着</p>" +
-            "<p class=\"timeline-line\">移動 " + routeStep.travelMinutes + "分 / 待ち " + routeStep.waitMinutes + "分</p>" +
+            "<p class=\"timeline-line\">移動 " + routeStep.travelMinutes + "分 / 待ち " + routeStep.waitMinutes + "分 / 所要 " + routeStep.rideMinutes + "分</p>" +
             "<p class=\"timeline-line\">" + escapeHtml(routeStep.readyTime) + " 次へ移動</p>" +
           "</div>"
         : "<p class=\"card-description\">" + escapeHtml(entry.item.description || "") + "</p>";
@@ -397,6 +672,7 @@
           "<div class=\"badge-row\">" +
             "<span class=\"badge\">待ち時間: " + waitLabel + "</span>" +
             "<span class=\"badge alt\">移動: " + travelLabel + "</span>" +
+            "<span class=\"badge alt\">所要: " + durationLabel + "</span>" +
             (entry.travelInfo.mode === "fallback-center" ? "" : "<span class=\"badge neutral\">" + travelHint + "</span>") +
           "</div>" +
           timelineHtml +
@@ -542,7 +818,9 @@
 
     const cleaned = input.value.trim();
     if (!cleaned) {
-      delete state.waitTimes[id];
+      if (getWaitImportState(id) !== "manual-needed") {
+        delete state.waitTimes[id];
+      }
       persistState();
       renderRanking();
       if (event.type === "change") {
@@ -585,9 +863,28 @@
     renderRanking();
   }
 
-  function getWaitTime(id) {
+  function getWaitEntry(id) {
     const entry = state.waitTimes[id];
+    return entry && typeof entry === "object" ? entry : null;
+  }
+
+  function getWaitTime(id) {
+    const entry = getWaitEntry(id);
     return entry && Number.isInteger(entry.waitTime) ? entry.waitTime : null;
+  }
+
+  function getWaitImportState(id) {
+    const entry = getWaitEntry(id);
+    return entry && typeof entry.importState === "string" ? entry.importState : "";
+  }
+
+  function getWaitImportReason(id) {
+    const entry = getWaitEntry(id);
+    return entry && typeof entry.statusReason === "string" ? entry.statusReason : "";
+  }
+
+  function getWaitStatusStampLabel(reason) {
+    return WAIT_STATUS_STAMP_LABELS[reason] || "案内不可";
   }
 
   function addToRanking(id) {
@@ -1064,7 +1361,7 @@
   }
 
   function isAttractionUnavailable(item) {
-    return Boolean(item) && UNAVAILABLE_ATTRACTION_IDS.has(item.id);
+    return Boolean(item) && (UNAVAILABLE_ATTRACTION_IDS.has(item.id) || getWaitImportState(item.id) === "status");
   }
 
   function isRestaurantUnavailable(item) {
@@ -1159,14 +1456,16 @@
         ? entry.travelInfo.minutes
         : getTravelMinutesBetweenAreas(previousAreaCode, currentAreaCode);
       const waitMinutes = entry.waitTime === null ? UNKNOWN_WAIT_PENALTY : entry.waitTime;
+      const rideMinutes = Number.isInteger(entry.item.durationMinutes) ? entry.item.durationMinutes : 0;
       const arrivalMinutes = currentMinutes + travelMinutes;
-      const readyMinutes = arrivalMinutes + waitMinutes;
+      const readyMinutes = arrivalMinutes + waitMinutes + rideMinutes;
 
       steps.push({
         arrivalTime: formatMinutesToTimeString(arrivalMinutes),
         readyTime: formatMinutesToTimeString(readyMinutes),
         travelMinutes: travelMinutes,
-        waitMinutes: waitMinutes
+        waitMinutes: waitMinutes,
+        rideMinutes: rideMinutes
       });
 
       currentMinutes = readyMinutes;
