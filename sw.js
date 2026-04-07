@@ -1,4 +1,4 @@
-const CACHE_VERSION = "tdl-planner-v1";
+const CACHE_VERSION = "tdl-planner-v2";
 const APP_SHELL_CACHE = `${CACHE_VERSION}-shell`;
 const RUNTIME_CACHE = `${CACHE_VERSION}-runtime`;
 
@@ -7,6 +7,8 @@ const APP_SHELL_FILES = [
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./wait-import-config.js",
+  "./attraction-durations.js",
   "./manifest.webmanifest",
   "./favicon.png",
   "./data/attractions.js",
